@@ -1,5 +1,7 @@
-.venv/
 .env
+.venv/
+gingerbot.db
 __pycache__/
 *.pyc
+.DS_Store
 
