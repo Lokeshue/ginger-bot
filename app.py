@@ -7,7 +7,7 @@ from datetime import date, timedelta
 import streamlit as st
 from dotenv import load_dotenv
 from duckduckgo_search import DDGS
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 
 from db import init_db, SessionLocal, Subscription
 
@@ -17,25 +17,41 @@ from db import init_db, SessionLocal, Subscription
 load_dotenv()
 init_db()
 
-api_key = os.getenv("OPENAI_API_KEY")
+st.set_page_config(page_title="GingerBOT", page_icon="🤖")
+st.title("GingerBOT")
+
+# Read secrets correctly for BOTH local (.env) and Streamlit Cloud (Secrets)
+def get_secret(name: str, default: str = "") -> str:
+    val = os.getenv(name)
+    if val:
+        return val
+    try:
+        return st.secrets.get(name, default)  # works on Streamlit Cloud
+    except Exception:
+        return default
+
+api_key = get_secret("OPENAI_API_KEY")
 if not api_key:
-    st.error("Missing OPENAI_API_KEY. Add it to your .env file.")
+    st.error("Missing OPENAI_API_KEY. Add it to Streamlit Secrets or your .env file.")
     st.stop()
 
 client = OpenAI(api_key=api_key)
 
-st.set_page_config(page_title="GingerBOT", page_icon="🤖")
-st.title("GingerBOT")
+# Model: use Streamlit Secret OPENAI_MODEL if provided; otherwise safe default
+MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
 # ----------------------------
 # Subscription Reminder UI
 # ----------------------------
-st.header("⏰ Subscription Reminders (Email)")
+st.header("Subscription Reminders (Email)")
 
 with st.form("add_subscription_form", clear_on_submit=True):
     service_name = st.text_input("Service name (e.g., Netflix, Adobe)", "")
     trial_end_date = st.date_input("Trial end date", value=date.today() + timedelta(days=1))
-    notify_email = st.text_input("Email to notify", os.getenv("SMTP_USER", ""))
+
+    # Prefer SMTP_USER (your code), otherwise show blank
+    default_email = get_secret("SMTP_USER", "")
+    notify_email = st.text_input("Email to notify", default_email)
 
     submitted = st.form_submit_button("Add reminder")
     if submitted:
@@ -55,7 +71,7 @@ with st.form("add_subscription_form", clear_on_submit=True):
             )
             db.commit()
             db.close()
-            st.success(f"Added reminder for {service_name.strip()} ending on {trial_end_date} ✅")
+            st.success(f"Added reminder for {service_name.strip()} ending on {trial_end_date}")
             st.rerun()
 
 # List existing subscriptions
@@ -63,7 +79,7 @@ db = SessionLocal()
 subs = db.query(Subscription).order_by(Subscription.trial_end_date.asc()).all()
 db.close()
 
-st.subheader("📋 Saved reminders")
+st.subheader("Saved reminders")
 if not subs:
     st.info("No reminders yet. Add one above.")
 else:
@@ -72,7 +88,7 @@ else:
         c1.write(s.service_name)
         c2.write(str(s.trial_end_date))
         c3.write(s.user_email)
-        if c4.button("🗑️", key=f"del_{s.id}"):
+        if c4.button("Delete", key=f"del_{s.id}"):
             db = SessionLocal()
             db.query(Subscription).filter(Subscription.id == s.id).delete()
             db.commit()
@@ -85,27 +101,27 @@ st.divider()
 # Tools
 # ----------------------------
 def tool_web_search(query: str) -> str:
+    query = (query or "").strip()
+    if not query:
+        return "No query provided."
     results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=5):
-            title = r.get("title", "").strip()
-            href = r.get("href", "").strip()
-            body = r.get("body", "").strip()
-            results.append(f"- {title}\n  {href}\n  {body}")
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=5):
+                title = (r.get("title") or "").strip()
+                href = (r.get("href") or "").strip()
+                body = (r.get("body") or "").strip()
+                results.append(f"- {title}\n  {href}\n  {body}")
+    except Exception as e:
+        return f"Web search error: {e}"
     return "\n".join(results) if results else "No results found."
 
 def tool_calculator(expression: str) -> str:
-    """
-    Safer-ish calculator:
-    - disallows suspicious characters
-    - eval with no builtins, only math module
-    """
     expr = (expression or "").strip()
     if not expr:
         return "Calculator error: empty expression"
 
-    # Allow only digits, operators, parentheses, whitespace, decimal, commas, and 'math.' names.
-    # This is a simple guard; for maximum safety, implement AST-based evaluation.
+    # Simple character whitelist guard (still not perfect; good enough for demo)
     if not re.fullmatch(r"[0-9\.\+\-\*\/\%\(\)\s,matha-zA-Z_]+", expr):
         return "Calculator error: invalid characters"
 
@@ -118,6 +134,9 @@ def tool_calculator(expression: str) -> str:
         return f"Calculator error: {e}"
 
 def tool_save_note(note: str) -> str:
+    note = (note or "").strip()
+    if not note:
+        return "Nothing to save."
     st.session_state.notes.append(note)
     return "Saved."
 
@@ -183,7 +202,7 @@ tool_schemas = [
 # ----------------------------
 # Chat UI + Agent Loop
 # ----------------------------
-st.header("💬 Chat")
+st.header("Chat")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -212,28 +231,38 @@ if user_text:
     with st.chat_message("user"):
         st.markdown(user_text)
 
-    # First call: allow tool use
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=st.session_state.messages,
-        tools=tool_schemas,
-        tool_choice="auto",
-    )
+    # 1) First call: allow tool use (with model fallback)
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=st.session_state.messages,
+            tools=tool_schemas,
+            tool_choice="auto",
+        )
+    except BadRequestError:
+        # fallback if MODEL isn't available for your key
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=st.session_state.messages,
+            tools=tool_schemas,
+            tool_choice="auto",
+        )
 
     msg = response.choices[0].message
 
     # If no tool calls, respond directly
     if not getattr(msg, "tool_calls", None):
-        st.session_state.messages.append({"role": "assistant", "content": msg.content or ""})
+        assistant_text = msg.content or ""
+        st.session_state.messages.append({"role": "assistant", "content": assistant_text})
         with st.chat_message("assistant"):
-            st.markdown(msg.content or "")
+            st.markdown(assistant_text)
     else:
         # Execute each tool call
         for tc in msg.tool_calls:
             fn_name = tc.function.name
 
             try:
-                args = json.loads(tc.function.arguments or "{}")  # ✅ safe JSON parse
+                args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
 
@@ -264,11 +293,17 @@ if user_text:
                 }
             )
 
-        # Second call: final answer using tool outputs
-        final = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=st.session_state.messages,
-        )
+        # 2) Second call: final answer using tool outputs (with model fallback)
+        try:
+            final = client.chat.completions.create(
+                model=MODEL,
+                messages=st.session_state.messages,
+            )
+        except BadRequestError:
+            final = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=st.session_state.messages,
+            )
 
         final_text = final.choices[0].message.content or ""
         st.session_state.messages.append({"role": "assistant", "content": final_text})
