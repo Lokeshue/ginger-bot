@@ -1,14 +1,7 @@
-# Secrets
 .env
 .streamlit/secrets.toml
-
-# Virtual env
 .venv/
-venv/
-
-# Python cache
 __pycache__/
 *.pyc
-
-# Local DB / data
 *.db
+.DS_Store
