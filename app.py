@@ -20,13 +20,12 @@ init_db()
 st.set_page_config(page_title="GingerBOT", page_icon="🤖")
 st.title("GingerBOT")
 
-# Read secrets correctly for BOTH local (.env) and Streamlit Cloud (Secrets)
 def get_secret(name: str, default: str = "") -> str:
     val = os.getenv(name)
     if val:
         return val
     try:
-        return st.secrets.get(name, default)  # works on Streamlit Cloud
+        return st.secrets.get(name, default)
     except Exception:
         return default
 
@@ -36,8 +35,6 @@ if not api_key:
     st.stop()
 
 client = OpenAI(api_key=api_key)
-
-# Model: use Streamlit Secret OPENAI_MODEL if provided; otherwise safe default
 MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
 # ----------------------------
@@ -49,7 +46,6 @@ with st.form("add_subscription_form", clear_on_submit=True):
     service_name = st.text_input("Service name (e.g., Netflix, Adobe)", "")
     trial_end_date = st.date_input("Trial end date", value=date.today() + timedelta(days=1))
 
-    # Prefer SMTP_USER (your code), otherwise show blank
     default_email = get_secret("SMTP_USER", "")
     notify_email = st.text_input("Email to notify", default_email)
 
@@ -74,7 +70,6 @@ with st.form("add_subscription_form", clear_on_submit=True):
             st.success(f"Added reminder for {service_name.strip()} ending on {trial_end_date}")
             st.rerun()
 
-# List existing subscriptions
 db = SessionLocal()
 subs = db.query(Subscription).order_by(Subscription.trial_end_date.asc()).all()
 db.close()
@@ -120,11 +115,8 @@ def tool_calculator(expression: str) -> str:
     expr = (expression or "").strip()
     if not expr:
         return "Calculator error: empty expression"
-
-    # Simple character whitelist guard (still not perfect; good enough for demo)
     if not re.fullmatch(r"[0-9\.\+\-\*\/\%\(\)\s,matha-zA-Z_]+", expr):
         return "Calculator error: invalid characters"
-
     allowed_globals = {"__builtins__": {}}
     safe_locals = {"math": math}
     try:
@@ -219,7 +211,6 @@ if "messages" not in st.session_state:
 if "notes" not in st.session_state:
     st.session_state.notes = []
 
-# Render chat history
 for m in st.session_state.messages:
     if m["role"] in ("user", "assistant"):
         with st.chat_message(m["role"]):
@@ -231,7 +222,7 @@ if user_text:
     with st.chat_message("user"):
         st.markdown(user_text)
 
-    # 1) First call: allow tool use (with model fallback)
+    # 1) First call: allow tool use
     try:
         response = client.chat.completions.create(
             model=MODEL,
@@ -240,7 +231,6 @@ if user_text:
             tool_choice="auto",
         )
     except BadRequestError:
-        # fallback if MODEL isn't available for your key
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=st.session_state.messages,
@@ -257,7 +247,29 @@ if user_text:
         with st.chat_message("assistant"):
             st.markdown(assistant_text)
     else:
-        # Execute each tool call
+        # ✅ FIX: Append the assistant tool_calls message BEFORE tool outputs
+        assistant_tool_calls = []
+        for tc in msg.tool_calls:
+            assistant_tool_calls.append(
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments or "{}",
+                    },
+                }
+            )
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": assistant_tool_calls,
+            }
+        )
+
+        # Execute each tool call and append tool output
         for tc in msg.tool_calls:
             fn_name = tc.function.name
 
@@ -283,17 +295,15 @@ if user_text:
                 except Exception as e:
                     out = f"Tool error ({fn_name}): {e}"
 
-            # Append tool output
             st.session_state.messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "name": fn_name,
                     "content": out,
                 }
             )
 
-        # 2) Second call: final answer using tool outputs (with model fallback)
+        # 2) Second call: final answer using tool outputs
         try:
             final = client.chat.completions.create(
                 model=MODEL,
